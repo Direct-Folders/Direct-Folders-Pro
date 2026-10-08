@@ -1,0 +1,74 @@
+[package]
+name = "exbar-cli"
+version = "1.4.0"
+edition = "2024"
+authors = ["Jamison Wilde"]
+description = "Explorer Bar (Exbar) CLI installer helper"
+license = "MIT"
+
+[[bin]]
+name = "exbar"
+path = "src/bin/exbar.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Memory",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Console",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemServices",
+    "Win32_System_DataExchange",
+    "Win32_Graphics_Dwm",
+    "Win32_Storage_FileSystem",
+] }
+
+[dependencies.windows-core]
+version = "0.61"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
+# Lint gate: deny warnings and clippy::all at build time. Pedantic is
+# held at `allow` because `warnings = "deny"` in [lints.rust] captures
+# clippy warnings too, which would promote every pedantic finding to
+# a hard error. Auditing pedantic findings is documented as follow-up
+# in docs/ci-plan.md.
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+bare_urls = "deny"
+invalid_codeblock_attributes = "deny"
+invalid_html_tags = "deny"
+redundant_explicit_links = "deny"

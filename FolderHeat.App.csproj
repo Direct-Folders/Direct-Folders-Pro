@@ -1,0 +1,37 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\FolderHeat.Application\FolderHeat.Application.csproj" />
+    <ProjectReference Include="..\FolderHeat.Infrastructure\FolderHeat.Infrastructure.csproj" />
+    <ProjectReference Include="..\FolderHeat.Domain\FolderHeat.Domain.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon>Assets\FolderHeat.ico</ApplicationIcon>
+    <Version>0.7.0</Version>
+    <AssemblyVersion>0.7.0.0</AssemblyVersion>
+    <FileVersion>0.7.0.0</FileVersion>
+    <Product>FolderHeat</Product>
+    <Authors>Javier Garate Copello</Authors>
+    <GeneratePortableZip Condition="'$(GeneratePortableZip)' == ''">true</GeneratePortableZip>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\FolderHeat.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <Target Name="GenerateFolderHeatPortableZip"
+          AfterTargets="Build"
+          Condition="'$(GeneratePortableZip)' == 'true' and '$(Configuration)' == 'Release'">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\..\eng\package-portable.ps1&quot; -Configuration &quot;$(Configuration)&quot;" />
+  </Target>
+
+</Project>

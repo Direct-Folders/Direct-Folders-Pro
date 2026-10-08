@@ -1,0 +1,408 @@
+//! Binary entry point for the exbar CLI.
+//!
+//! Three subcommands:
+//!
+//! - `exbar hook` — production. Installs the foreground WinEvent hook
+//!   and runs the message pump. Started by the MSI's `HKCU\…\Run\Exbar`
+//!   entry at login. Calls `FreeConsole()` immediately so post-install
+//!   actions don't flash a console window.
+//! - `exbar status` — diagnostic. Prints whether Explorer is reachable,
+//!   the loaded `~/.exbar.json` (if any), and exits.
+//! - `exbar install` / `exbar uninstall` — dev-only fallbacks. End
+//!   users use the MSI; these subcommands wire/unwire the Run key
+//!   manually for development iteration.
+//!
+//! See `docs/adrs/ADR-0001-out-of-process-winevent-hook.md` for why
+//! exbar runs as its own process.
+//!
+//! The runtime modules live in the `exbar_cli` library crate; this
+//! binary only orchestrates them.
+
+// In release builds, mark this binary as Windows-subsystem so no console
+// is allocated at launch. A console-subsystem binary, when launched via
+// the MSI post-install action, the Run key, or a Start Menu shortcut,
+// causes Windows Terminal (if set as default terminal) to briefly claim
+// the console as a new tab — which then vanishes when `FreeConsole()`
+// runs inside `run_hook()`. Debug builds remain console-subsystem so
+// `cargo run -- status` prints to the terminal during development.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use clap::{Parser, Subcommand};
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
+use std::path::PathBuf;
+use std::process::Command;
+
+use windows::Win32::Foundation::WIN32_ERROR;
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, REG_SZ, RegCloseKey, RegCreateKeyW, RegSetValueExW,
+};
+use windows::core::PCWSTR;
+
+use exbar_cli::error::{ExbarError, ExbarResult};
+use exbar_cli::log as exbar_log;
+use exbar_cli::visibility;
+
+// ── CLI definition ────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(name = "exbar", about = "Manage the Exbar Explorer toolbar")]
+struct Cli {
+    /// No subcommand = run as hook (this is how the MSI's WixShellExec
+    /// launches us post-install, and how the Start Menu shortcut works).
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// [DEV ONLY] Install the Explorer extension (end users should use the MSI installer)
+    Install,
+    /// [DEV ONLY] Uninstall the Explorer extension (end users should use Windows Settings → Apps)
+    Uninstall {
+        /// Also delete the config and local data
+        #[arg(long)]
+        clean: bool,
+    },
+    /// Show installation status
+    Status,
+    /// Run as background hook process (started by the MSI installer's Run key)
+    Hook,
+}
+
+fn main() {
+    let cli = Cli::parse();
+    match cli.command.unwrap_or(Commands::Hook) {
+        Commands::Install => {
+            if let Err(e) = install() {
+                eprintln!("Install failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Uninstall { clean } => {
+            if let Err(e) = uninstall(clean) {
+                eprintln!("Uninstall failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Status => {
+            if let Err(e) = status() {
+                eprintln!("Status failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Hook => {
+            if let Err(e) = run_hook() {
+                eprintln!("Hook failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+// ── Helper: wide string ───────────────────────────────────────────────────────
+
+fn to_wide_null(s: &str) -> Vec<u16> {
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+// ── Helper: registry ──────────────────────────────────────────────────────────
+
+/// Open or create a key under HKCU.
+fn reg_create_key(subkey: &str) -> ExbarResult<HKEY> {
+    let subkey_w = to_wide_null(subkey);
+    let mut hkey = HKEY::default();
+    let err: WIN32_ERROR =
+        unsafe { RegCreateKeyW(HKEY_CURRENT_USER, PCWSTR(subkey_w.as_ptr()), &mut hkey) };
+    if err.is_ok() {
+        Ok(hkey)
+    } else {
+        Err(ExbarError::Win32(windows::core::Error::from(
+            err.to_hresult(),
+        )))
+    }
+}
+
+fn reg_set_string(hkey: HKEY, value_name: &str, data: &str) -> ExbarResult<()> {
+    let name_w = to_wide_null(value_name);
+    let data_w = to_wide_null(data);
+    let data_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data_w.as_ptr().cast::<u8>(), data_w.len() * 2) };
+    let err: WIN32_ERROR = unsafe {
+        RegSetValueExW(
+            hkey,
+            PCWSTR(name_w.as_ptr()),
+            None,
+            REG_SZ,
+            Some(data_bytes),
+        )
+    };
+    if err.is_ok() {
+        Ok(())
+    } else {
+        Err(ExbarError::Win32(windows::core::Error::from(
+            err.to_hresult(),
+        )))
+    }
+}
+
+// ── Install paths ─────────────────────────────────────────────────────────────
+
+fn local_appdata() -> PathBuf {
+    PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_else(|_| {
+        format!(
+            r"C:\Users\{}\AppData\Local",
+            std::env::var("USERNAME").unwrap_or_default()
+        )
+    }))
+}
+
+fn install_dir() -> PathBuf {
+    local_appdata().join("Exbar")
+}
+
+fn config_path() -> PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| "C:\\Users\\Default".into());
+    PathBuf::from(home).join(".exbar.json")
+}
+
+// ── Run key path ──────────────────────────────────────────────────────────────
+
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "Exbar";
+
+// ── hook ──────────────────────────────────────────────────────────────────────
+
+fn run_hook() -> ExbarResult<()> {
+    use windows::Win32::System::Com::CoUninitialize;
+    use windows::Win32::System::Console::FreeConsole;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, TranslateMessage,
+    };
+
+    // Detach from any inherited console so no terminal window appears.
+    unsafe {
+        let _ = FreeConsole();
+    }
+
+    // One-shot migration from the pre-1.2 layout (~/.exbar.json,
+    // ~/.exbar-pos.json) to the new ~/.exbar/ directory. Idempotent
+    // and best-effort; failures log a warning and we proceed.
+    exbar_cli::paths::migrate_legacy_files();
+
+    // Declare per-monitor DPI awareness BEFORE any window is created.
+    // Without this, Windows treats exbar.exe as a legacy DPI-unaware
+    // app and applies bitmap upscaling on top of our layout — which
+    // manifests as a giant toolbar with tiny text on high-DPI monitors.
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        };
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
+    // OleInitialize sets up STA + OLE drag-drop infrastructure.
+    // RegisterDragDrop requires OleInitialize, not just CoInitializeEx.
+    unsafe {
+        use windows::Win32::System::Ole::OleInitialize;
+        let _ = OleInitialize(None);
+    }
+
+    // Initialise file logger from config (falls back to Info if config absent).
+    let log_level = exbar_cli::config::Config::load()
+        .as_ref()
+        .map(|c| c.log_level)
+        .unwrap_or_default();
+    exbar_log::init(log_level);
+
+    // Install the foreground event hook. Because WINEVENT_OUTOFCONTEXT
+    // marshals callbacks to the thread that installed the hook (provided
+    // that thread has a message pump), our GetMessage loop below will
+    // drive the toolbar's wndproc AND receive foreground-change events
+    // — both on the same thread.
+    //
+    // The first CabinetWClass foreground event triggers toolbar creation
+    // inside foreground_event_proc.
+    let (system_hook, location_hook, show_hide_hook) = visibility::install_foreground_hook(); // TEMP-DIAG: show_hide_hook
+    log::info!("run_hook: foreground hook installed; entering message pump");
+
+    // SetWinEventHook only fires for future events. If Explorer is already
+    // foreground, create the toolbar now instead of waiting for the next
+    // foreground change.
+    {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let fg = unsafe { GetForegroundWindow() };
+        let class = exbar_cli::explorer::get_class_name(fg);
+        if class == "CabinetWClass" {
+            // Same cold-Explorer race as the foreground handler, and more
+            // likely here: at login the Run key starts us while Explorer is
+            // still building its XAML bridge.
+            match exbar_cli::explorer::check_explorer_ready(fg) {
+                Some(info) => {
+                    let hinst = exbar_cli::lifecycle::exe_hinstance();
+                    let _ = exbar_cli::lifecycle::create_toolbar(
+                        info.cabinet_hwnd,
+                        &info.default_pos,
+                        hinst,
+                    );
+                }
+                None => exbar_cli::bootstrap::schedule_retry(fg),
+            }
+        }
+    }
+
+    // Message pump — runs indefinitely.
+    let mut msg = MSG::default();
+    loop {
+        let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        if ret.0 == 0 || ret.0 == -1 {
+            break;
+        }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    // Cleanup — unreachable in normal operation.
+    // SAFETY: hooks are the handles returned by the matching
+    // install_foreground_hook call on this thread.
+    unsafe {
+        use windows::Win32::UI::Accessibility::UnhookWinEvent;
+        let _ = UnhookWinEvent(system_hook);
+        let _ = UnhookWinEvent(location_hook);
+        let _ = UnhookWinEvent(show_hide_hook); // TEMP-DIAG
+    }
+    unsafe {
+        CoUninitialize();
+    }
+    Ok(())
+}
+
+// ── install ───────────────────────────────────────────────────────────────────
+
+fn install() -> ExbarResult<()> {
+    // Create install directory (for the config stub; the MSI handles
+    // the real install path for end users).
+    let dst_dir = install_dir();
+    std::fs::create_dir_all(&dst_dir).map_err(|e| ExbarError::io(&dst_dir, e))?;
+
+    // Create stub config if missing
+    let cfg = config_path();
+    if !cfg.exists() {
+        let stub = serde_json::json!({
+            "folders": [
+                { "name": "Downloads", "path": "shell:Downloads" },
+                { "name": "Documents", "path": "shell:Personal" },
+                { "name": "Desktop",   "path": "shell:Desktop" }
+            ]
+        });
+        std::fs::write(&cfg, serde_json::to_string_pretty(&stub).unwrap())
+            .map_err(|e| ExbarError::io(&cfg, e))?;
+        println!("Created config at {}", cfg.display());
+    } else {
+        println!("Config already exists at {}", cfg.display());
+    }
+
+    // Register Run key
+    let exe_path = std::env::current_exe()
+        .map_err(|e| ExbarError::io("<current_exe>", e))?
+        .to_string_lossy()
+        .into_owned();
+    let run_value = format!("\"{exe_path}\" hook");
+    let hkey = reg_create_key(RUN_KEY)?;
+    reg_set_string(hkey, RUN_VALUE, &run_value)?;
+    unsafe {
+        exbar_cli::warn_on_err!(RegCloseKey(hkey).ok());
+    }
+    println!("Registered Run key: {run_value}");
+
+    // Start hook process (detached)
+    let _ = Command::new(&exe_path)
+        .arg("hook")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| ())
+        .map(|_| println!("Hook process started."));
+
+    println!("Install complete.");
+    Ok(())
+}
+
+// ── uninstall ─────────────────────────────────────────────────────────────────
+
+fn uninstall(clean: bool) -> ExbarResult<()> {
+    // 1. Remove Run key
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteValueW, RegOpenKeyW};
+    {
+        let run_key_w = to_wide_null(RUN_KEY);
+        let mut hkey = HKEY::default();
+        let err = unsafe { RegOpenKeyW(HKEY_CURRENT_USER, PCWSTR(run_key_w.as_ptr()), &mut hkey) };
+        if err.is_ok() {
+            let val_w = to_wide_null(RUN_VALUE);
+            unsafe {
+                exbar_cli::warn_on_err!(RegDeleteValueW(hkey, PCWSTR(val_w.as_ptr())).ok());
+            }
+            unsafe {
+                exbar_cli::warn_on_err!(RegCloseKey(hkey).ok());
+            }
+            println!("Removed Run key.");
+        }
+    }
+
+    // 2. Kill any running hook process
+    let _ = Command::new("taskkill")
+        .args(["/f", "/im", "exbar.exe"])
+        .output();
+    println!("Killed hook process (if running).");
+
+    // 3. If --clean, remove install dir
+    if clean {
+        let dir = install_dir();
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| ExbarError::io(&dir, e))?;
+            println!("Deleted {}.", dir.display());
+        }
+    }
+
+    println!("Uninstall complete. (~/.exbar.json left in place)");
+    Ok(())
+}
+
+// ── status ────────────────────────────────────────────────────────────────────
+
+fn status() -> ExbarResult<()> {
+    let exe = std::env::current_exe().map_err(|e| ExbarError::io("<current_exe>", e))?;
+    println!("exbar.exe:      {}", exe.display());
+
+    let cfg = config_path();
+    if cfg.exists() {
+        match std::fs::read_to_string(&cfg)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        {
+            Some(v) => {
+                let count = v
+                    .get("folders")
+                    .and_then(|f| f.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                println!("Config:         OK — {count} folder(s) ({})", cfg.display());
+            }
+            None => {
+                println!("Config:         INVALID ({})", cfg.display());
+            }
+        }
+    } else {
+        println!("Config:         MISSING ({})", cfg.display());
+    }
+
+    Ok(())
+}
